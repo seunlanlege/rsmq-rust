@@ -41,7 +41,7 @@
 use failure::{Error, format_err};
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
-use std::{default::Default, ops::DerefMut};
+use std::default::Default;
 use redis::{from_redis_value, RedisError, RedisResult, Value, ErrorKind as RedisErrorKind};
 
 /// Queue struct.
@@ -181,8 +181,8 @@ impl Rsmq {
 
 	/// Create a new queue.
 	pub async fn create_queue(&self, opts: Queue) -> Result<u8, Error> {
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qky = self.queue_hash_key(&opts.qname);
@@ -204,8 +204,8 @@ impl Rsmq {
 
 	/// Deletes a queue and all messages.
 	pub async fn delete_queue(&self, qname: &str) -> Result<Value, Error> {
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = self.message_zset_key(qname);
@@ -221,8 +221,8 @@ impl Rsmq {
 
 	/// List all queues.
 	pub async fn list_queues(&self) -> Result<Vec<String>, Error> {
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = format!("{}:QUEUES", self.name_space);
@@ -246,8 +246,8 @@ impl Rsmq {
 		let (_, ts, _) = self.get_queue(&qname, false).await?;
 		let key = self.message_zset_key(qname);
 		let expires_at = ts + hidefor * 1000u64;
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		redis::Script::new(LUA)
@@ -277,8 +277,8 @@ impl Rsmq {
 		}
 		let key = self.message_zset_key(qname);
 		let qky = self.queue_hash_key(qname);
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		redis::pipe().atomic()
@@ -293,8 +293,8 @@ impl Rsmq {
 	/// Deletes a message from a queue.
 	pub async fn delete_message(&self, qname: &str, msgid: &str) -> Result<bool, Error> {
 		let key = self.message_zset_key(qname);
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let (delete_count, deleted_fields_count): (u32, u32) = redis::pipe()
@@ -345,8 +345,8 @@ impl Rsmq {
     "##;
 		let (_, ts, _) = self.get_queue(qname, false).await?;
 		let key = self.message_zset_key(qname);
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let m: Message = redis::Script::new(LUA)
@@ -387,8 +387,8 @@ impl Rsmq {
 		let vt = vt.unwrap_or(q.vt);
 		let key = self.message_zset_key(qname);
 		let expires_at = ts + vt * 1000u64;
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 
@@ -404,8 +404,8 @@ impl Rsmq {
 	/// Get queue attributes, counter and stats.
 	pub async fn get_queue_attributes(&self, qname: &str) -> Result<Queue, Error> {
 		// TODO: validate qname
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = self.message_zset_key(qname);
@@ -474,8 +474,8 @@ impl Rsmq {
 		delay: Option<u64>,
 		maxsize: Option<i64>,
 	) -> Result<Queue, Error> {
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qkey = self.queue_hash_key(qname);
@@ -495,8 +495,8 @@ impl Rsmq {
 	}
 
 	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>), Error> {
-		let con = self.pool.get()
-			.await?
+		let mut con = self.pool.get().await?;
+		let con = con
 			.as_mut()
 			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qkey = self.queue_hash_key(qname);
