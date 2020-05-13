@@ -1,22 +1,72 @@
+//!
+//! # Redis Simple Message Queue
+//! A lightweight message queue for Node.js that requires no dedicated queue server. Just a Redis server.
+//!
+// ! [![Build Status](https://secure.travis-ci.org/dvdplm/rsmq-rust.png?branch=master)](http://travis-ci.org/dvdplm/rsmq-rust)
+//! [![Dependency Status](https://david-dm.org/dvdplm/rsmq-rust.svg)](https://david-dm.org/dvdplm/rsmq-rust)
+//!
+//! **tl;dr:** If you run a Redis server and currently use Amazon SQS or a similar message queue you might as well use
+//! this fast little replacement.
+//!
+//! ## Features
+//! * Lightweight: **Just Redis** and ~500 lines of rust.
+//! * Speed: Send/receive 10000+ messages per second on an average machine. It's **just Redis**.
+//! * Guaranteed **delivery of a message to exactly one recipient** within a messages visibility timeout.
+//! * Received messages that are not deleted will reappear after the visibility timeout.
+//! * A message is deleted by the message id. The message id is returned by the `send_message` and `receive_message`
+//! method.
+//! * Messages stay in the queue unless deleted.
+//! * async/await support.
+//!
+//! **Note:** RSMQ uses the Redis EVAL command (LUA scripts) so the minimum Redis version is 2.6+.
+//!
+//! ## Usage
+//! * After creating a queue you can send messages to that queue.
+//! * The messages will be handled in a **FIFO** (first in first out) manner unless specified with a delay.
+//! * Every message has a unique `id` that you can use to delete the message.
+//! * The `send_message` method will return the `id` for a sent message.
+//! * The `receive_message` method will return an `id` along with the message and some stats.
+//! * Should you not delete the message it will be eligible to be received again after the visibility timeout is
+//! reached.
+//! * Please have a look at the `create_queue` and `receive_message` methods described below for optional parameters
+//! like **visibility timeout** and **delay**.
+//!
+//! ## Installation
+//! `Cargo.toml`
+//! ```toml
+//! rsmq = "*"
+//! ```
+//!
+
 use failure::{Error, format_err};
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use std::{default::Default, ops::DerefMut};
 use redis::{from_redis_value, RedisError, RedisResult, Value, ErrorKind as RedisErrorKind};
 
+/// Queue struct.
 #[derive(Clone, Debug)]
 pub struct Queue {
+	/// The Queue name.
 	pub qname: String,
+	/// The visibility timeout for the queue in seconds.
 	pub vt: u64,
+	/// The delay for new messages in seconds.
 	pub delay: u64,
+	/// The maximum size of a message in bytes.
 	pub maxsize: i64,
+	/// Total number of messages received from the queue.
 	pub totalrecv: u64,
+	/// Total number of messages sent to the queue.
 	pub totalsent: u64,
+	/// Timestamp (epoch in seconds) when the queue was created.
 	pub created: u64,
+	/// Timestamp (epoch in seconds) when the queue was last modified with `Rsmq::set_queue_attributes`.
 	pub modified: u64,
-	// current message count
+	/// Current number of messages in the queue.
 	pub msgs: u64,
-	// hidden, aka "in-flight" messages + delayed messages
+	/// Current number of hidden / not visible messages. A message can be hidden while "in flight" due to a vt
+	/// parameter or when sent with a delay.
 	pub hiddenmsgs: u64,
 }
 
@@ -48,15 +98,19 @@ impl Default for Queue {
 	}
 }
 
+/// Message pulled off the queue.
 #[derive(Clone, Debug)]
 pub struct Message {
+	/// The internal message id.
 	pub id: String,
-	pub message: String,
+	/// Number of times this message was received.
 	pub rc: u64,
-	// Receive count
+	/// Timestamp of when this message was first received.
 	pub fr: u64,
-	// First receive time
+	/// Timestamp of when this message was sent / created.
 	pub sent: u64,
+	/// The message's contents.
+	pub message: String,
 }
 
 impl Message {
@@ -98,6 +152,7 @@ impl redis::FromRedisValue for Message {
 	}
 }
 
+/// The RSMQ instance.
 pub struct Rsmq {
 	pool: Pool<RedisConnectionManager>,
 	name_space: String,
@@ -110,6 +165,7 @@ impl std::fmt::Debug for Rsmq {
 }
 
 impl Rsmq {
+	/// Creates a new instance of RSMQ.
 	pub async fn new<T: redis::IntoConnectionInfo>(params: T, name_space: &str) -> Result<Rsmq, Error> {
 		let manager = RedisConnectionManager::new(params)?;
 		let pool = bb8::Pool::builder().build(manager).await?;
@@ -123,6 +179,7 @@ impl Rsmq {
 		Ok(Rsmq { pool, name_space })
 	}
 
+	/// Create a new queue.
 	pub async fn create_queue(&self, opts: Queue) -> Result<u8, Error> {
 		let con = self.pool.get()
 			.await?
@@ -145,6 +202,7 @@ impl Rsmq {
 		Ok(res)
 	}
 
+	/// Deletes a queue and all messages.
 	pub async fn delete_queue(&self, qname: &str) -> Result<Value, Error> {
 		let con = self.pool.get()
 			.await?
@@ -161,6 +219,7 @@ impl Rsmq {
 			.map_err(|e| e.into())
 	}
 
+	/// List all queues.
 	pub async fn list_queues(&self) -> Result<Vec<String>, Error> {
 		let con = self.pool.get()
 			.await?
@@ -174,42 +233,8 @@ impl Rsmq {
 			.map_err(|e| e.into())
 	}
 
-	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>), Error> {
-		let con = self.pool.get()
-			.await?
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
-		let qkey = self.queue_hash_key(qname);
-		let ((vt, delay, maxsize), (secs, micros)): ((u64, u64, i64), (u64, u64)) = redis::pipe()
-			.atomic()
-			.cmd("HMGET").arg(qkey).arg("vt").arg("delay").arg("maxsize")
-			.cmd("TIME")
-			.query_async(con)
-			.await?;
-
-		let ts_micros = secs * 1_000_000 + micros;
-		let ts = ts_micros / 1_000; // Epoch time in milliseconds
-		let q = Queue {
-			qname: qname.into(),
-			vt,
-			delay,
-			maxsize,
-			..Default::default()
-		};
-		// This is a bit crazy. The JS version calls getQueue with the `set_uid` set to `true` only from `sendMessage`
-		// where it is used to write the timestamp+random stuff that constituates the (sort)key. This is just a port of
-		// that behavior. I don't understand why it is baked in with the queue attrib fetch.
-		let uid = if set_uid {
-			let ts_rad36 = radix::RadixNum::from(ts_micros).with_radix(36).unwrap().as_str().to_lowercase().to_string();
-			// TODO: make this work
-			// let ts_rad36 = radix::RadixNum::from(ts_micros).with_radix(36)?.as_str().to_lowercase().to_string();
-			Some(ts_rad36 + &make_id_22())
-		} else {
-			None
-		};
-		Ok((q, ts, uid))
-	}
-
+	/// Change the visibility timer of a single message.
+	/// The time when the message will be visible again is calculated from the current time (now) + vt.
 	pub async fn change_message_visibility(&self, qname: &str, msgid: &str, hidefor: u64) -> Result<u64, Error> {
 		const LUA: &'static str = r#"
             local msg = redis.call("ZSCORE", KEYS[1], KEYS[2])
@@ -234,6 +259,12 @@ impl Rsmq {
 		Ok(expires_at)
 	}
 
+	/// Sends a new message.
+	///
+	/// # Parameters
+	///
+	/// `delay`: (Default: queue settings) The time in seconds that the delivery of the message
+	/// will be delayed. Allowed values: 0-9999999 (around 115 days).
 	pub async fn send_message(&self, qname: &str, message: &str, delay: Option<u64>) -> Result<String, Error> {
 		let (q, ts, uid) = self.get_queue(&qname, true).await?;
 		let uid = uid.ok_or(format_err!("Did not get a proper uid back from Redis"))?;
@@ -259,6 +290,7 @@ impl Rsmq {
 		Ok(uid)
 	}
 
+	/// Deletes a message from a queue.
 	pub async fn delete_message(&self, qname: &str, msgid: &str) -> Result<bool, Error> {
 		let key = self.message_zset_key(qname);
 		let con = self.pool.get()
@@ -285,6 +317,12 @@ impl Rsmq {
 		}
 	}
 
+	/// Receive the next message from the queue and delete it.
+	///
+	/// # Important
+	///
+	/// This method deletes the message it receives right away. There is no way to receive the message
+	/// again if something goes wrong while working on the message.
 	pub async fn pop_message(&self, qname: &str) -> Result<Message, Error> {
 		const LUA: &'static str = r##"
       local msg = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", KEYS[2], "LIMIT", "0", "1")
@@ -319,7 +357,13 @@ impl Rsmq {
 		Ok(m)
 	}
 
-	pub async fn receive_message(&self, qname: &str, hidefor: Option<u64>) -> Result<Message, Error> {
+	/// Receive the next message from the queue.
+	///
+	/// # Parameters
+	///
+	/// The vt param: optional (Default: queue settings) The length of time, in seconds, that the received message
+	/// will be invisible to others. Allowed values: 0-9999999 (around 115 days).
+	pub async fn receive_message(&self, qname: &str, vt: Option<u64>) -> Result<Message, Error> {
 		const LUA: &'static str = r##"
       local msg = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", KEYS[2], "LIMIT", "0", "1")
 			if #msg == 0 then
@@ -340,9 +384,9 @@ impl Rsmq {
 			return o
       "##;
 		let (q, ts, _) = self.get_queue(&qname, false).await?;
-		let hidefor = hidefor.unwrap_or(q.vt);
+		let vt = vt.unwrap_or(q.vt);
 		let key = self.message_zset_key(qname);
-		let expires_at = ts + hidefor * 1000u64;
+		let expires_at = ts + vt * 1000u64;
 		let con = self.pool.get()
 			.await?
 			.as_mut()
@@ -357,6 +401,7 @@ impl Rsmq {
 		Ok(m)
 	}
 
+	/// Get queue attributes, counter and stats.
 	pub async fn get_queue_attributes(&self, qname: &str) -> Result<Queue, Error> {
 		// TODO: validate qname
 		let con = self.pool.get()
@@ -408,6 +453,20 @@ impl Rsmq {
 		Ok(q)
 	}
 
+	/// Sets queue parameters.
+	///
+	/// # Parameters
+	///
+	/// `vt`: The length of time, in seconds, that a message received from a queue will be
+	/// invisible to other receiving components when they ask to receive messages. Allowed values: 0-999999
+	/// (around 115 days).
+	///
+	/// `delay`: The time in seconds that the delivery of all new messages in the queue will be delayed.
+	/// Allowed values: 0-9999999 (around 115 days)
+	///
+	/// `maxsize`: The maximum message size in bytes. Allowed values: 1024-65536 and -1 (for unlimited size).
+	///
+	// Note: At least one attribute (vt, delay, maxsize) must be supplied. Only attributes that are supplied will be modified.
 	pub async fn set_queue_attributes(
 		&self,
 		qname: &str,
@@ -433,6 +492,42 @@ impl Rsmq {
 		pipe.atomic().query_async::<_, ()>(con).await?;
 		let q = self.get_queue_attributes(qname).await?;
 		Ok(q)
+	}
+
+	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>), Error> {
+		let con = self.pool.get()
+			.await?
+			.as_mut()
+			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
+		let qkey = self.queue_hash_key(qname);
+		let ((vt, delay, maxsize), (secs, micros)): ((u64, u64, i64), (u64, u64)) = redis::pipe()
+			.atomic()
+			.cmd("HMGET").arg(qkey).arg("vt").arg("delay").arg("maxsize")
+			.cmd("TIME")
+			.query_async(con)
+			.await?;
+
+		let ts_micros = secs * 1_000_000 + micros;
+		let ts = ts_micros / 1_000; // Epoch time in milliseconds
+		let q = Queue {
+			qname: qname.into(),
+			vt,
+			delay,
+			maxsize,
+			..Default::default()
+		};
+		// This is a bit crazy. The JS version calls getQueue with the `set_uid` set to `true` only from `sendMessage`
+		// where it is used to write the timestamp+random stuff that constituates the (sort)key. This is just a port of
+		// that behavior. I don't understand why it is baked in with the queue attrib fetch.
+		let uid = if set_uid {
+			let ts_rad36 = radix::RadixNum::from(ts_micros).with_radix(36).unwrap().as_str().to_lowercase().to_string();
+			// TODO: make this work
+			// let ts_rad36 = radix::RadixNum::from(ts_micros).with_radix(36)?.as_str().to_lowercase().to_string();
+			Some(ts_rad36 + &make_id_22())
+		} else {
+			None
+		};
+		Ok((q, ts, uid))
 	}
 
 	fn queue_hash_key(&self, qname: &str) -> String {
