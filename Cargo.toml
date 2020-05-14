@@ -13,7 +13,7 @@ radix = "0.6.0"
 rand = "0.7.3"
 bb8 = "0.4.2"
 bb8-redis = "0.5.0"
-failure = "0.1.1"
+derive_more = "0.99"
 
 [dev-dependencies]
 criterion = "0.1.1"

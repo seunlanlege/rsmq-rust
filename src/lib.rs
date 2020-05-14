@@ -38,11 +38,10 @@
 //! ```
 //!
 
-use failure::{Error, format_err};
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use std::default::Default;
-use redis::{from_redis_value, RedisError, RedisResult, Value, ErrorKind as RedisErrorKind};
+use redis::{from_redis_value, RedisError, Value, ErrorKind as RedisErrorKind, RedisResult};
 
 /// Queue struct.
 #[derive(Clone, Debug)]
@@ -125,12 +124,23 @@ impl Message {
 	}
 }
 
+/// Error type
+#[derive(Debug, derive_more::From, derive_more::Display)]
+pub enum Error {
+	Redis(RedisError),
+	BB8(bb8::RunError<RedisError>),
+	#[display(fmt = "{}", _0)]
+	Other(&'static str)
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
 impl redis::FromRedisValue for Message {
 	fn from_redis_value(v: &Value) -> RedisResult<Message> {
 		match *v {
 			Value::Bulk(ref items) => {
 				if items.len() == 0 {
-					return Err(RedisError::from((RedisErrorKind::TryAgain, "No messages to receive")));
+					Err(RedisError::from((RedisErrorKind::TryAgain, "No messages to receive")))?;
 				}
 				let mut m = Message::new();
 				m.id = from_redis_value(&items[0])?;
@@ -139,15 +149,15 @@ impl redis::FromRedisValue for Message {
 				m.fr = from_redis_value(&items[3])?;
 				m.sent = match u64::from_str_radix(&m.id[0..10], 36) {
 					Ok(ts) => ts,
-					Err(e) => return Err(RedisError::from((
+					Err(e) => Err(RedisError::from((
 						RedisErrorKind::TypeError,
 						"timestamp parsing error",
 						format!("Could not convert '{:?}' to a timestamp. Error: {}", &m.id[0..10], e)
-					)))
+					)))?
 				};
 				Ok(m)
 			}
-			_ => Err(RedisError::from((RedisErrorKind::IoError, "Redis did not return a Value::Bulk"))),
+			_ => Err(RedisError::from((RedisErrorKind::IoError, "Redis did not return a Value::Bulk")))?,
 		}
 	}
 }
@@ -166,7 +176,7 @@ impl std::fmt::Debug for Rsmq {
 
 impl Rsmq {
 	/// Creates a new instance of RSMQ.
-	pub async fn new<T: redis::IntoConnectionInfo>(params: T, name_space: &str) -> Result<Rsmq, Error> {
+	pub async fn new<T: redis::IntoConnectionInfo>(params: T, name_space: &str) -> Result<Rsmq> {
 		let manager = RedisConnectionManager::new(params)?;
 		let pool = bb8::Pool::builder().build(manager).await?;
 
@@ -180,7 +190,7 @@ impl Rsmq {
 	}
 
 	/// Create a new queue.
-	pub async fn create_queue(&self, opts: Queue) -> Result<u8, Error> {
+	pub async fn create_queue(&self, opts: Queue) -> Result<u8> {
 		let mut con = self.pool.get().await?;
 		let con = con
 			.as_mut()
@@ -203,7 +213,7 @@ impl Rsmq {
 	}
 
 	/// Deletes a queue and all messages.
-	pub async fn delete_queue(&self, qname: &str) -> Result<Value, Error> {
+	pub async fn delete_queue(&self, qname: &str) -> Result<Value> {
 		let mut con = self.pool.get().await?;
 		let con = con
 			.as_mut()
@@ -220,7 +230,7 @@ impl Rsmq {
 	}
 
 	/// List all queues.
-	pub async fn list_queues(&self) -> Result<Vec<String>, Error> {
+	pub async fn list_queues(&self) -> Result<Vec<String>> {
 		let mut con = self.pool.get().await?;
 		let con = con
 			.as_mut()
@@ -235,7 +245,7 @@ impl Rsmq {
 
 	/// Change the visibility timer of a single message.
 	/// The time when the message will be visible again is calculated from the current time (now) + vt.
-	pub async fn change_message_visibility(&self, qname: &str, msgid: &str, hidefor: u64) -> Result<u64, Error> {
+	pub async fn change_message_visibility(&self, qname: &str, msgid: &str, hidefor: u64) -> Result<u64> {
 		const LUA: &'static str = r#"
             local msg = redis.call("ZSCORE", KEYS[1], KEYS[2])
 			if not msg then
@@ -265,9 +275,9 @@ impl Rsmq {
 	///
 	/// `delay`: (Default: queue settings) The time in seconds that the delivery of the message
 	/// will be delayed. Allowed values: 0-9999999 (around 115 days).
-	pub async fn send_message(&self, qname: &str, message: &str, delay: Option<u64>) -> Result<String, Error> {
+	pub async fn send_message(&self, qname: &str, message: &str, delay: Option<u64>) -> Result<String> {
 		let (q, ts, uid) = self.get_queue(&qname, true).await?;
-		let uid = uid.ok_or(format_err!("Did not get a proper uid back from Redis"))?;
+		let uid = uid.ok_or("Did not get a proper uid back from Redis")?;
 		let delay = delay.unwrap_or(q.delay);
 
 		if q.maxsize != -1 && message.as_bytes().len() > q.maxsize as usize {
@@ -291,7 +301,7 @@ impl Rsmq {
 	}
 
 	/// Deletes a message from a queue.
-	pub async fn delete_message(&self, qname: &str, msgid: &str) -> Result<bool, Error> {
+	pub async fn delete_message(&self, qname: &str, msgid: &str) -> Result<bool> {
 		let key = self.message_zset_key(qname);
 		let mut con = self.pool.get().await?;
 		let con = con
@@ -323,7 +333,7 @@ impl Rsmq {
 	///
 	/// This method deletes the message it receives right away. There is no way to receive the message
 	/// again if something goes wrong while working on the message.
-	pub async fn pop_message(&self, qname: &str) -> Result<Message, Error> {
+	pub async fn pop_message(&self, qname: &str) -> Result<Message> {
 		const LUA: &'static str = r##"
       local msg = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", KEYS[2], "LIMIT", "0", "1")
 			if #msg == 0 then
@@ -363,7 +373,7 @@ impl Rsmq {
 	///
 	/// The vt param: optional (Default: queue settings) The length of time, in seconds, that the received message
 	/// will be invisible to others. Allowed values: 0-9999999 (around 115 days).
-	pub async fn receive_message(&self, qname: &str, vt: Option<u64>) -> Result<Message, Error> {
+	pub async fn receive_message(&self, qname: &str, vt: Option<u64>) -> Result<Message> {
 		const LUA: &'static str = r##"
       local msg = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", KEYS[2], "LIMIT", "0", "1")
 			if #msg == 0 then
@@ -402,7 +412,7 @@ impl Rsmq {
 	}
 
 	/// Get queue attributes, counter and stats.
-	pub async fn get_queue_attributes(&self, qname: &str) -> Result<Queue, Error> {
+	pub async fn get_queue_attributes(&self, qname: &str) -> Result<Queue> {
 		// TODO: validate qname
 		let mut con = self.pool.get().await?;
 		let con = con
@@ -473,7 +483,7 @@ impl Rsmq {
 		vt: Option<u64>,
 		delay: Option<u64>,
 		maxsize: Option<i64>,
-	) -> Result<Queue, Error> {
+	) -> Result<Queue> {
 		let mut con = self.pool.get().await?;
 		let con = con
 			.as_mut()
@@ -494,7 +504,7 @@ impl Rsmq {
 		Ok(q)
 	}
 
-	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>), Error> {
+	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>)> {
 		let mut con = self.pool.get().await?;
 		let con = con
 			.as_mut()
