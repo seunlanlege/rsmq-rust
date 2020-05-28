@@ -12,22 +12,22 @@ rsmq = "*"
 ## Usage
 
 ```rust
-extern crate rsmq;
-
 use rsmq::*;
 
+#[tokio::main]
 fn main() {
-  let rsmq = Rsmq::new("redis://127.0.0.1/").expect("Can't connect to Redis");
-  let qopts = QueueOpts {
+  let rsmq = Rsmq::new("redis://127.0.0.1/").await.expect("Can't connect to Redis");
+  let qopts = Queue {
     qname: "my-queue".into(),
     vt: 60,
     delay: 120,
-    maxsize: 3000,
+	maxsize: 3000,
+	..Default::default()
   };
-  rsmq.create_queue(qopts).expect("queue creation failed");
-  let qs = rsmq.list_queues().expect("Nope, no listing for you");
+  rsmq.create_queue(qopts).await.expect("queue creation failed");
+  let qs = rsmq.list_queues().await.expect("Nope, no listing for you");
   println!("List queues: {:?}", qs);
-  rsmq.delete_queue("my-queue").expect("q deletion failed");
+  rsmq.delete_queue("my-queue").await.expect("q deletion failed");
 }
 ```
 ## Contributing
