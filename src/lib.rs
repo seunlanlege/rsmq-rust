@@ -40,6 +40,7 @@
 
 use deadpool_redis::{Pool, PoolError, Manager};
 use std::default::Default;
+use std::sync::Arc;
 use redis::{from_redis_value, RedisError, Value, ErrorKind as RedisErrorKind, RedisResult};
 
 /// Queue struct.
@@ -163,7 +164,7 @@ impl redis::FromRedisValue for Message {
 
 /// The RSMQ instance.
 pub struct Rsmq {
-	pool: Pool,
+	pool: Arc<Pool>,
 	name_space: String,
 }
 
@@ -187,7 +188,7 @@ impl Rsmq {
 			pool_size,
 			name_space,
 		} = params;
-		let pool = Pool::new(Manager::new(url)?, pool_size);
+		let pool = Arc::new(Pool::new(Manager::new(url)?, pool_size));
 
 		let name_space = if name_space != "" {
 			name_space.into()
@@ -199,7 +200,7 @@ impl Rsmq {
 	}
 
 	/// Creates a new instance of RSMQ.
-	pub async fn with_pool(pool: Pool, name_space: String) -> Self {
+	pub async fn with_pool(pool: Arc<Pool>, name_space: String) -> Self {
 		Rsmq { pool, name_space }
 	}
 
