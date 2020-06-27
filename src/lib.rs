@@ -38,8 +38,7 @@
 //! ```
 //!
 
-use bb8::Pool;
-use bb8_redis::RedisConnectionManager;
+use deadpool_redis::{Pool, PoolError, Manager};
 use std::default::Default;
 use redis::{from_redis_value, RedisError, Value, ErrorKind as RedisErrorKind, RedisResult};
 
@@ -128,7 +127,7 @@ impl Message {
 #[derive(Debug, derive_more::From, derive_more::Display)]
 pub enum Error {
 	Redis(RedisError),
-	BB8(bb8::RunError<RedisError>),
+	Deadpool(PoolError),
 	#[display(fmt = "{}", _0)]
 	Other(&'static str)
 }
@@ -164,21 +163,20 @@ impl redis::FromRedisValue for Message {
 
 /// The RSMQ instance.
 pub struct Rsmq {
-	pool: Pool<RedisConnectionManager>,
+	pool: Pool,
 	name_space: String,
 }
 
 impl std::fmt::Debug for Rsmq {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-		write!(f, "redis namespace: {}, {:?}", self.name_space, self.pool)
+		write!(f, "redis namespace: {}", self.name_space)
 	}
 }
 
 impl Rsmq {
 	/// Creates a new instance of RSMQ.
 	pub async fn new<T: redis::IntoConnectionInfo>(params: T, name_space: &str) -> Result<Rsmq> {
-		let manager = RedisConnectionManager::new(params)?;
-		let pool = bb8::Pool::builder().build(manager).await?;
+		let pool = Pool::new(Manager::new(params)?, 16);
 
 		let name_space = if name_space != "" {
 			name_space.into()
@@ -189,14 +187,17 @@ impl Rsmq {
 		Ok(Rsmq { pool, name_space })
 	}
 
+	/// Creates a new instance of RSMQ.
+	pub async fn with_pool(pool: Pool, name_space: String) -> Self {
+		Rsmq { pool, name_space }
+	}
+
+
 	/// Create a new queue.
 	pub async fn create_queue(&self, opts: Queue) -> Result<u8> {
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qky = self.queue_hash_key(&opts.qname);
-		let (ts, _): (u32, u32) = redis::cmd("TIME").query_async(con).await?;
+		let (ts, _): (u32, u32) = redis::cmd("TIME").query_async(&mut **con).await?;
 		let (res, ): (u8, ) = redis::pipe()
 			.atomic()
 			.cmd("HSETNX").arg(&qky).arg("vt").arg(opts.vt).ignore()
@@ -207,7 +208,7 @@ impl Rsmq {
 			.cmd("HSETNX").arg(&qky).arg("created").arg(ts).ignore()
 			.cmd("HSETNX").arg(&qky).arg("modified").arg(ts).ignore()
 			.cmd("SADD").arg(format!("{}:QUEUES", self.name_space)).arg(opts.qname)
-			.query_async(con)
+			.query_async(&mut **con)
 			.await?;
 		Ok(res)
 	}
@@ -215,16 +216,13 @@ impl Rsmq {
 	/// Deletes a queue and all messages.
 	pub async fn delete_queue(&self, qname: &str) -> Result<Value> {
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = self.message_zset_key(qname);
 		redis::pipe()
 			.atomic()
 			.cmd("DEL").arg(format!("{}:Q", &key)).ignore() // The queue hash
 			.cmd("DEL").arg(&key).ignore() // The messages zset
 			.cmd("SREM").arg(format!("{}:QUEUES", self.name_space)).arg(qname).ignore()
-			.query_async(con)
+			.query_async(&mut **con)
 			.await
 			.map_err(|e| e.into())
 	}
@@ -232,13 +230,10 @@ impl Rsmq {
 	/// List all queues.
 	pub async fn list_queues(&self) -> Result<Vec<String>> {
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = format!("{}:QUEUES", self.name_space);
 		redis::cmd("SMEMBERS")
 			.arg(key)
-			.query_async(con)
+			.query_async(&mut **con)
 			.await
 			.map_err(|e| e.into())
 	}
@@ -257,14 +252,11 @@ impl Rsmq {
 		let key = self.message_zset_key(qname);
 		let expires_at = ts + hidefor * 1000u64;
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		redis::Script::new(LUA)
 			.key(key)
 			.key(msgid)
 			.key(expires_at)
-			.invoke_async::<_, ()>(con)
+			.invoke_async::<_, ()>(&mut **con)
 			.await?;
 		Ok(expires_at)
 	}
@@ -288,14 +280,11 @@ impl Rsmq {
 		let key = self.message_zset_key(qname);
 		let qky = self.queue_hash_key(qname);
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		redis::pipe().atomic()
 			.cmd("ZADD").arg(&key).arg(ts + delay * 1000).arg(&uid).ignore()
 			.cmd("HSET").arg(&qky).arg(&uid).arg(message).ignore()
 			.cmd("HINCRBY").arg(&qky).arg("totalsent").arg(1).ignore()
-			.query_async::<_, ()>(con)
+			.query_async::<_, ()>(&mut **con)
 			.await?;
 		Ok(uid)
 	}
@@ -304,9 +293,6 @@ impl Rsmq {
 	pub async fn delete_message(&self, qname: &str, msgid: &str) -> Result<bool> {
 		let key = self.message_zset_key(qname);
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let (delete_count, deleted_fields_count): (u32, u32) = redis::pipe()
 			.atomic()
 			.cmd("ZREM")
@@ -317,7 +303,7 @@ impl Rsmq {
 			.arg(msgid)
 			.arg(format!("{}:rc", &key))
 			.arg(format!("{}:fr", &key))
-			.query_async(con)
+			.query_async(&mut **con)
 			.await?;
 
 		if delete_count == 1 && deleted_fields_count > 0 {
@@ -356,13 +342,10 @@ impl Rsmq {
 		let (_, ts, _) = self.get_queue(qname, false).await?;
 		let key = self.message_zset_key(qname);
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let m: Message = redis::Script::new(LUA)
 			.key(key)
 			.key(ts)
-			.invoke_async(con)
+			.invoke_async(&mut **con)
 			.await?;
 		Ok(m)
 	}
@@ -398,15 +381,12 @@ impl Rsmq {
 		let key = self.message_zset_key(qname);
 		let expires_at = ts + vt * 1000u64;
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 
 		let m: Message = redis::Script::new(LUA)
 			.key(key)
 			.key(ts)
 			.key(expires_at)
-			.invoke_async(con)
+			.invoke_async(&mut **con)
 			.await?;
 		Ok(m)
 	}
@@ -415,14 +395,11 @@ impl Rsmq {
 	pub async fn get_queue_attributes(&self, qname: &str) -> Result<Queue> {
 		// TODO: validate qname
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let key = self.message_zset_key(qname);
 		let qkey = self.queue_hash_key(qname);
 		// TODO: use transaction here to grab the time and then run the data fetch
 		let (time, _): (String, u32) = redis::cmd("TIME")
-			.query_async(con)
+			.query_async(&mut **con)
 			.await?;
 		let ts_str = format!("{}000", time);
 		// [[60, 10, 1200, 5, 7, 1512492628, 1512492628], 10, 9]
@@ -442,7 +419,7 @@ impl Rsmq {
 				.arg(&key)
 				.arg(ts_str)
 				.arg("+inf")
-			.query_async(con)
+			.query_async(&mut **con)
 			.await?;
 
 		let (vt, delay, maxsize, totalrecv, totalsent, created, modified) = out.0;
@@ -485,9 +462,6 @@ impl Rsmq {
 		maxsize: Option<i64>,
 	) -> Result<Queue> {
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qkey = self.queue_hash_key(qname);
 		let mut pipe = redis::pipe();
 		if vt.is_some() {
@@ -499,22 +473,19 @@ impl Rsmq {
 		if maxsize.is_some() {
 			pipe.cmd("HSET").arg(&qkey).arg("maxsize").arg(maxsize).ignore();
 		}
-		pipe.atomic().query_async::<_, ()>(con).await?;
+		pipe.atomic().query_async::<_, ()>(&mut **con).await?;
 		let q = self.get_queue_attributes(qname).await?;
 		Ok(q)
 	}
 
 	async fn get_queue(&self, qname: &str, set_uid: bool) -> Result<(Queue, u64, Option<String>)> {
 		let mut con = self.pool.get().await?;
-		let con = con
-			.as_mut()
-			.ok_or_else(|| RedisError::from((RedisErrorKind::IoError, "Unable to acquire connection")))?;
 		let qkey = self.queue_hash_key(qname);
 		let ((vt, delay, maxsize), (secs, micros)): ((u64, u64, i64), (u64, u64)) = redis::pipe()
 			.atomic()
 			.cmd("HMGET").arg(qkey).arg("vt").arg("delay").arg("maxsize")
 			.cmd("TIME")
-			.query_async(con)
+			.query_async(&mut **con)
 			.await?;
 
 		let ts_micros = secs * 1_000_000 + micros;
