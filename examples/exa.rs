@@ -3,7 +3,12 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
-	let rsmq = Rsmq::new("redis://127.0.0.1/", "rsmq")
+	let params = rsmq::RsmqParams {
+		url: "redis://127.0.0.1/",
+		name_space: "rsmq",
+		pool_size: 16,
+	};
+	let rsmq = Rsmq::new(params)
 		.await
 		.expect("Can't instantiate RSMQ");
 	println!("[main] Have rsmq instance: {:?}", rsmq);

@@ -1,7 +1,12 @@
 use rsmq::*;
 
-async fn setup(ns: &str) -> Rsmq {
-	let rsmq = Rsmq::new("redis://127.0.0.1/", ns).await.expect("Can't instantiate RSMQ");
+async fn setup(name_space: &'static str) -> Rsmq {
+	let params = rsmq::RsmqParams {
+		url: "redis://127.0.0.1/",
+		name_space,
+		pool_size: 16,
+	};
+	let rsmq = Rsmq::new(params).await.expect("Can't instantiate RSMQ");
 	rsmq.delete_queue("test-q").await.unwrap();
 	let q = Queue::new("test-q", None, None, None);
 	let res = rsmq.create_queue(q).await;

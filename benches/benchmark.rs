@@ -4,7 +4,12 @@ use futures::executor::block_on;
 
 #[test]
 fn criterion_benchmark() {
-	let rsmq = block_on(Rsmq::new("redis://127.0.0.1/", "rsmq"))
+	let params = rsmq::RsmqParams {
+		url: "redis://127.0.0.1/",
+		name_space: "rsmq",
+		pool_size: 16,
+	};
+	let rsmq = block_on(Rsmq::new(params))
 		.expect("Can't instantiate RSMQ");
 	let q = Queue::new("bench-queue", Some(60), Some(0), Some(1200));
 	block_on(rsmq.create_queue(q))

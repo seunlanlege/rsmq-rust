@@ -173,10 +173,21 @@ impl std::fmt::Debug for Rsmq {
 	}
 }
 
+pub struct RsmqParams<T: redis::IntoConnectionInfo> {
+	pub url: T,
+	pub pool_size: usize,
+	pub name_space: &'static str
+}
+
 impl Rsmq {
 	/// Creates a new instance of RSMQ.
-	pub async fn new<T: redis::IntoConnectionInfo>(params: T, name_space: &str) -> Result<Rsmq> {
-		let pool = Pool::new(Manager::new(params)?, 16);
+	pub async fn new<T: redis::IntoConnectionInfo>(params: RsmqParams<T>) -> Result<Rsmq> {
+		let RsmqParams {
+			url,
+			pool_size,
+			name_space,
+		} = params;
+		let pool = Pool::new(Manager::new(url)?, pool_size);
 
 		let name_space = if name_space != "" {
 			name_space.into()
