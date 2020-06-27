@@ -200,7 +200,7 @@ impl Rsmq {
 	}
 
 	/// Creates a new instance of RSMQ.
-	pub async fn with_pool(pool: Arc<Pool>, name_space: String) -> Self {
+	pub fn with_pool(pool: Arc<Pool>, name_space: String) -> Self {
 		Rsmq { pool, name_space }
 	}
 
